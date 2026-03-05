@@ -3,8 +3,10 @@ import asyncio
 import edge_tts
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs
-from typing import List
+from typing import List, Dict, Any
+import re
+import demjson3
+from datetime import datetime
 
 # ------------------------------------------------------------
 # STREAMLIT CONFIG
@@ -44,18 +46,78 @@ def chunk_text(text: str, max_len: int = 2500) -> List[str]:
         chunks.append(" ".join(current))
     return chunks
 
-def get_page_id_from_url(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-        return parse_qs(parsed.query).get("pgid", [None])[0]
-    except:
-        return None
-
 def truncate_for_preview(text: str, max_chars: int = 1500) -> str:
     """Truncate text for quick audio preview"""
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rsplit(' ', 1)[0] + "..."
+
+def format_date_for_api(date_obj: datetime) -> str:
+    """Format date as DD/MM/YYYY for API"""
+    return date_obj.strftime("%d/%m/%Y")
+
+# ------------------------------------------------------------
+# FETCH PAGE LIST FROM PROTHOM ALO (TODAY ONLY)
+# ------------------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_prothomalo_pglist(edate: str):
+    """Fetch available pages for a given date"""
+    url = f"https://epaper.prothomalo.com/Home/DIndex?edate={edate}"
+    
+    headers = {
+        "accept": "application/json, text/javascript, */*; q=0.01",
+        "content-type": "application/json; charset=utf-8",
+        "x-requested-with": "XMLHttpRequest",
+        "referer": f"https://epaper.prothomalo.com/Home/DIndex?eid=1&edate={edate}&sedId=1&pgid=498326&isProductPanel=true&MagazineEdID=0&MagEdDate={edate}&isIssueRefresh=False&uemail=",
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    }
+    
+    cookies = {
+        "ViewType_": "6",
+        "currentPubId": "1",
+        "EditionId": "1"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, cookies=cookies, timeout=30)
+        response.raise_for_status()
+        html_content = response.text
+        
+    except requests.RequestException as e:
+        return None
+    
+    # Extract pglist_ array using regex
+    pattern = r'var\s+pglist_\s*=\s*(\[.*?\]);\s*(?:\/\/Generate|$)'
+    match = re.search(pattern, html_content, re.DOTALL | re.IGNORECASE)
+    
+    if not match:
+        return None
+    
+    pglist_js_string = match.group(1)
+    
+    try:
+        pglist_data = demjson3.decode(pglist_js_string)
+        
+        if isinstance(pglist_data, list):
+            return pglist_data
+        else:
+            return None
+            
+    except Exception:
+        return None
+
+def build_page_options(pglist: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Build dropdown options from page list"""
+    options = {}
+    for page in pglist:
+        pgid = page.get("PageId")
+        pgname = page.get("NewsProPageTitle", "Unknown")
+        
+        if pgid:
+            label = f"Page {pgid}: {pgname}"
+            options[label] = str(pgid)
+    
+    return options
 
 # ------------------------------------------------------------
 # API FETCHING (CACHED)
@@ -66,7 +128,7 @@ def get_json(url: str):
         res = requests.get(url.strip(), timeout=10)
         res.raise_for_status()
         return res.json()
-    except Exception as e:
+    except Exception:
         return None
 
 # ------------------------------------------------------------
@@ -151,7 +213,6 @@ def generate_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-Bas
     if not chunks:
         return b""
     
-    # Create progress bar
     progress_bar = st.progress(0)
     
     try:
@@ -160,7 +221,6 @@ def generate_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-Bas
     finally:
         progress_bar.empty()
 
-# Cache audio by content hash
 @st.cache_data(show_spinner=False)
 def get_cached_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-BashkarNeural"):
     """Cache audio generation by content hash"""
@@ -175,10 +235,46 @@ if 'audio_cache' not in st.session_state:
 # ------------------------------------------------------------
 # STREAMLIT UI
 # ------------------------------------------------------------
-url = st.text_input("Paste the e-paper news page URL", "")
 
-# Audio settings sidebar
+# Get today's date (preset - no picker)
+today = datetime.now()
+today_date_str = format_date_for_api(today)
+
+# Sidebar - Page selection & Audio settings only
 with st.sidebar:
+    st.header("📅 Today's Edition")
+    st.info(f"📆 **{today.strftime('%d %B, %Y')}**")
+    
+    # Fetch page list for today
+    with st.spinner("📋 Loading pages..."):
+        pglist = fetch_prothomalo_pglist(edate=today_date_str)
+    
+    if pglist:
+        page_options = build_page_options(pglist)
+        
+        if page_options:
+            selected_label = st.selectbox(
+                "📄 Select Page",
+                options=list(page_options.keys()),
+                index=0,
+                help="Choose a page to view news articles"
+            )
+            
+            selected_page_id = page_options[selected_label]
+            st.session_state.selected_page_id = selected_page_id
+            st.session_state.selected_page_label = selected_label
+            
+            st.success(f"✅ {len(page_options)} pages available")
+        else:
+            st.error("❌ No pages available for today.")
+            st.session_state.selected_page_id = None
+    else:
+        st.error("❌ Failed to load page list. Please try again.")
+        st.session_state.selected_page_id = None
+    
+    st.divider()
+    
+    # Audio settings
     st.header("⚙️ Audio Settings")
     voice_option = st.selectbox(
         "Voice",
@@ -189,11 +285,12 @@ with st.sidebar:
                                help="Generate audio for first 1500 characters only")
     st.info("💡 Tip: Use Quick Preview for long articles to reduce wait time")
 
-if url:
-    page_id = get_page_id_from_url(url)
-    if not page_id:
-        st.error("❌ Invalid URL. Could not extract pgid.")
-        st.stop()
+# Main content area
+if st.session_state.get('selected_page_id'):
+    page_id = st.session_state.selected_page_id
+    
+    st.subheader(f"📰 Page: {st.session_state.get('selected_page_label', 'Unknown')}")
+    st.caption(f"Date: {today.strftime('%d/%m/%Y')}")
     
     with st.spinner("🔍 Scraping news (cached)…"):
         news_list = get_final_page_list(page_id)
@@ -223,7 +320,6 @@ if url:
                         audio_data = get_cached_audio(item['content'], preview_mode, voice_option)
                     
                     if audio_data:
-                        # Store in session state with unique key per article
                         st.session_state.audio_cache[idx] = audio_data
                         st.success("✅ Audio ready!")
             
@@ -238,6 +334,8 @@ if url:
                 st.write(item['content'])
             
             st.divider()
+else:
+    st.info("👈 Select a page from the sidebar to get started!")
 
 # Footer
 st.markdown("---")
