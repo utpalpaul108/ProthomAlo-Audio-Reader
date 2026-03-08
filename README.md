@@ -1,2 +1,2 @@
 # ProthomAlo-Audio-Reader
-Read ProthomAlo ePaper news
+Read ProthomAlo ePaper news in audio
