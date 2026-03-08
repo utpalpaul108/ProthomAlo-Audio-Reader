@@ -14,7 +14,8 @@ html, body, [data-testid="stAppViewContainer"] {
 }
 
 /* Hide default Streamlit branding */
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
+header { background: transparent !important; }
 [data-testid="stDecoration"]  { display: none; }
 
 /* ── Scrollbar ── */
