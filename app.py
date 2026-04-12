@@ -39,20 +39,43 @@ def clean_html(html: str) -> str:
         tag.decompose()
     return soup.get_text(" ").strip()
 
+def preprocess_for_tts(title: str, content: str) -> str:
+    """Combine title and content, then clean for natural TTS output."""
+    full_text = f"{title.strip()}। {content.strip()}"
+    full_text = re.sub(r'https?://\S+', '', full_text)
+    full_text = re.sub(r'([।!?])([^\s])', r'\1 \2', full_text)
+    full_text = re.sub(r'([।!?,;])\1+', r'\1', full_text)
+    full_text = re.sub(r'\s+', ' ', full_text).strip()
+    return full_text
+
 def chunk_text(text: str, max_len: int = 2500) -> List[str]:
-    words = text.split()
-    chunks, current = [], []
-    current_len = 0
-    for word in words:
-        word_len = len(word) + 1
-        if current_len + word_len < max_len:
-            current.append(word)
-            current_len += word_len
+    """Split text into chunks at sentence boundaries for natural TTS flow."""
+    sentences = re.split(r'(?<=[।!?])\s+', text)
+    chunks, current, current_len = [], [], 0
+    for sentence in sentences:
+        sentence_len = len(sentence) + 1
+        if current_len + sentence_len <= max_len:
+            current.append(sentence)
+            current_len += sentence_len
         else:
             if current:
                 chunks.append(" ".join(current))
-            current = [word]
-            current_len = word_len
+            if sentence_len > max_len:
+                # Sentence too long: split at commas
+                parts = re.split(r'(?<=[,;])\s+', sentence)
+                sub_current, sub_len = [], 0
+                for part in parts:
+                    part_len = len(part) + 1
+                    if sub_len + part_len <= max_len:
+                        sub_current.append(part)
+                        sub_len += part_len
+                    else:
+                        if sub_current:
+                            chunks.append(" ".join(sub_current))
+                        sub_current, sub_len = [part], part_len
+                current, current_len = sub_current, sub_len
+            else:
+                current, current_len = [sentence], sentence_len
     if current:
         chunks.append(" ".join(current))
     return chunks
@@ -60,7 +83,12 @@ def chunk_text(text: str, max_len: int = 2500) -> List[str]:
 def truncate_for_preview(text: str, max_chars: int = 1500) -> str:
     if len(text) <= max_chars:
         return text
-    return text[:max_chars].rsplit(' ', 1)[0] + "..."
+    cut = text[:max_chars]
+    # Try to end at a sentence boundary
+    last_sentence_end = max(cut.rfind('।'), cut.rfind('?'), cut.rfind('!'))
+    if last_sentence_end > max_chars // 2:
+        return cut[:last_sentence_end + 1] + "..."
+    return cut.rsplit(' ', 1)[0] + "..."
 
 def format_date_for_api(date_obj: datetime) -> str:
     return date_obj.strftime("%d/%m/%Y")
@@ -184,7 +212,8 @@ def generate_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-Bas
         progress_bar.empty()
 
 @st.cache_data(show_spinner=False)
-def get_cached_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-BashkarNeural", rate: str = "+0%"):
+def get_cached_audio(title: str, content: str, use_preview: bool = False, voice: str = "bn-IN-BashkarNeural", rate: str = "+0%"):
+    text = preprocess_for_tts(title, content)
     return generate_audio(text, use_preview, voice, rate)
 
 # ------------------------------------------------------------
@@ -443,12 +472,27 @@ if st.session_state.get('selected_page_id'):
         </div>
         """, unsafe_allow_html=True)
 
+        # Article length indicator
+        char_count = len(item['content'])
+        if char_count < 1000:
+            length_color, length_label = "#4ade80", "Short"
+        elif char_count < 3000:
+            length_color, length_label = "#f59e0b", "Medium"
+        else:
+            length_color, length_label = "#ef4444", "Long"
+        st.markdown(f"""
+        <div style="font-size:0.75rem; color:{length_color}; margin-bottom:0.5rem; opacity:0.8;">
+            📝 {length_color and length_label} article · {char_count:,} characters
+            {'&nbsp;·&nbsp; ⚡ Quick Preview recommended' if char_count > 3000 and not preview_mode else ''}
+        </div>
+        """, unsafe_allow_html=True)
+
         # Generate Audio button (full width)
         btn_label = "⚡ Quick Preview" if preview_mode else "▶ Generate Audio"
         play_key = f"play_{idx}"
         if st.button(btn_label, key=play_key, use_container_width=True):
             with st.spinner("🎧 Synthesising speech…"):
-                audio_data = get_cached_audio(item['content'], preview_mode, voice_option, speed_option)
+                audio_data = get_cached_audio(item['title'], item['content'], preview_mode, voice_option, speed_option)
             if audio_data:
                 st.session_state.audio_cache[idx] = audio_data
             else:
