@@ -32,19 +32,50 @@ load_css(Path(__file__).parent / "style.css")
 # UTILITIES
 # ------------------------------------------------------------
 def clean_html(html: str) -> str:
+    """Extract text from HTML, preserving paragraph breaks as double newlines."""
     soup = BeautifulSoup(html, "html.parser")
-    for br in soup.find_all("br"):
-        br.replace_with("\n")
     for tag in soup(["script", "style"]):
         tag.decompose()
+    # Block-level elements → paragraph separator
+    for tag in soup.find_all(["p", "div", "br", "h1", "h2", "h3", "h4", "li"]):
+        tag.insert_before("\n\n")
     return soup.get_text(" ").strip()
 
+# Noise patterns that appear in scraped e-paper text and sound bad when read aloud
+_NOISE_PATTERNS = [
+    r'\(?\s*ফাইল\s*ছবি\s*\)?',          # "(ফাইল ছবি)" – file photo caption
+    r'\(?\s*ছবি\s*[:：]\s*[^)।\n]*\)?',  # "ছবি: photographer name"
+    r'\(?\s*প্রতিবেদক\s*\)?',            # reporter credit
+    r'\(?\s*সংবাদদাতা\s*\)?',            # correspondent credit
+    r'\(?\s*বিশেষ\s*প্রতিনিধি\s*\)?',   # special correspondent
+    r'\(?\s*স্টাফ\s*রিপোর্টার\s*\)?',   # staff reporter
+    r'https?://\S+',                       # raw URLs
+    r'\*{2,}',                             # repeated asterisks
+]
+
 def preprocess_for_tts(title: str, content: str) -> str:
-    """Combine title and content, then clean for natural TTS output."""
-    full_text = f"{title.strip()}। {content.strip()}"
-    full_text = re.sub(r'https?://\S+', '', full_text)
+    """
+    Combine title + content and clean for natural, realistic TTS output.
+    - Removes noise (captions, bylines, URLs)
+    - Converts paragraph breaks into sentence-ending pauses
+    - Normalises punctuation spacing
+    """
+    # Remove noise from content before combining
+    clean = content.strip()
+    for pattern in _NOISE_PATTERNS:
+        clean = re.sub(pattern, '', clean, flags=re.IGNORECASE)
+
+    # Paragraph breaks → sentence-ending pause (। causes natural TTS pause)
+    clean = re.sub(r'\n\n+', '। ', clean)
+    clean = re.sub(r'\n', ' ', clean)
+
+    full_text = f"{title.strip()}। {clean}"
+
+    # Spacing after sentence endings
     full_text = re.sub(r'([।!?])([^\s])', r'\1 \2', full_text)
+    # Collapse repeated punctuation
     full_text = re.sub(r'([।!?,;])\1+', r'\1', full_text)
+    # Collapse whitespace
     full_text = re.sub(r'\s+', ' ', full_text).strip()
     return full_text
 
@@ -147,41 +178,57 @@ def get_json(url: str):
 # ------------------------------------------------------------
 # SCRAPING (CACHED)
 # ------------------------------------------------------------
+def _fetch_one_story(region_id: str) -> Dict[str, Any] | None:
+    """Fetch and parse a single story by its OrgId. Returns {title, content} or None."""
+    story_details = get_json(f"https://epaper.prothomalo.com/User/ShowArticleView?OrgId={region_id}")
+    if not story_details:
+        return None
+    content_list = story_details.get("StoryContent", [])
+    if not content_list:
+        return None
+    title = content_list[0].get("Headlines", "")
+    if isinstance(title, list):
+        title = " ".join(title)
+    title = title.strip()
+    if not title:
+        return None
+    body = content_list[0].get("Body", "")
+    linked_id = story_details.get("LinkedStoryId", 0)
+    if linked_id:
+        detail = get_json(f"https://epaper.prothomalo.com/Home/getstorydetail?Storyid={linked_id}")
+        if detail:
+            detail_list = detail.get("StoryContent", [])
+            if detail_list:
+                body += " " + detail_list[0].get("Body", "")
+    return {"title": title, "content": clean_html(body)}
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_final_page_list(page_id: str):
     news_raw = get_json(f"https://epaper.prothomalo.com/Home/getStoriesOnPage?pageid={page_id}")
     if not news_raw:
         return []
-    news_list = []
-    for story in news_raw:
-        region_id = story.get("OrgId")
-        if not region_id:
-            continue
-        story_details = get_json(f"https://epaper.prothomalo.com/User/ShowArticleView?OrgId={region_id}")
-        if not story_details:
-            continue
-        content_list = story_details.get("StoryContent", [])
-        if not content_list:
-            continue
-        title = content_list[0].get("Headlines")
-        if isinstance(title, list):
-            title = " ".join(title)
-        title = title.strip()
-        body = content_list[0].get("Body", "")
-        linked_id = story_details.get("LinkedStoryId", 0)
-        if linked_id:
-            detail = get_json(f"https://epaper.prothomalo.com/Home/getstorydetail?Storyid={linked_id}")
-            detail_list = detail.get("StoryContent", [])
-            if detail_list:
-                body += " " + detail_list[0].get("Body", "")
-        final_content = clean_html(body)
-        news_list.append({"title": title, "content": final_content})
-    return news_list
+    region_ids = [str(s["OrgId"]) for s in news_raw if s.get("OrgId")]
+    if not region_ids:
+        return []
+
+    # Fetch all stories in parallel using a thread pool
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results_map: Dict[int, Dict] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_idx = {executor.submit(_fetch_one_story, rid): i for i, rid in enumerate(region_ids)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            result = future.result()
+            if result:
+                results_map[idx] = result
+
+    # Return in original page order, skip empty
+    return [results_map[i] for i in sorted(results_map) if results_map[i]["content"].strip()]
 
 # ------------------------------------------------------------
 # TTS GENERATION
 # ------------------------------------------------------------
-async def generate_audio_chunk(text: str, voice: str = "bn-IN-BashkarNeural", rate: str = "+0%") -> bytes:
+async def generate_audio_chunk(text: str, voice: str, rate: str) -> bytes:
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     output = b""
     async for chunk in communicate.stream():
@@ -190,13 +237,33 @@ async def generate_audio_chunk(text: str, voice: str = "bn-IN-BashkarNeural", ra
     return output
 
 async def generate_all_chunks_async(chunks: List[str], voice: str, rate: str, progress_bar) -> bytes:
-    audio_bytes = b""
+    """Generate all chunks in parallel, then stitch in order."""
     total = len(chunks)
-    for i, chunk in enumerate(chunks):
-        audio_data = await generate_audio_chunk(chunk, voice, rate)
-        audio_bytes += audio_data
-        progress_bar.progress((i + 1) / total)
-    return audio_bytes
+    completed = 0
+
+    async def tracked(coro):
+        nonlocal completed
+        result = await coro
+        completed += 1
+        progress_bar.progress(completed / total)
+        return result
+
+    tasks = [tracked(generate_audio_chunk(chunk, voice, rate)) for chunk in chunks]
+    results = await asyncio.gather(*tasks)
+    return b"".join(results)
+
+def estimate_reading_time(text: str, speed_pct: int) -> str:
+    """Estimate TTS reading duration from character count and speed."""
+    # Bangla TTS reads ~10–12 chars/sec at normal speed
+    base_chars_per_sec = 11.0
+    multiplier = 1 + (speed_pct / 100)
+    chars_per_sec = base_chars_per_sec * max(multiplier, 0.1)
+    total_seconds = len(text) / chars_per_sec
+    mins = int(total_seconds // 60)
+    secs = int(total_seconds % 60)
+    if mins == 0:
+        return f"~{secs}s"
+    return f"~{mins}m {secs}s"
 
 def generate_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-BashkarNeural", rate: str = "+0%"):
     if use_preview:
@@ -206,9 +273,14 @@ def generate_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-Bas
         return b""
     progress_bar = st.progress(0)
     try:
-        audio_bytes = asyncio.run(generate_all_chunks_async(chunks, voice, rate, progress_bar))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        audio_bytes = loop.run_until_complete(
+            generate_all_chunks_async(chunks, voice, rate, progress_bar)
+        )
         return audio_bytes
     finally:
+        loop.close()
         progress_bar.empty()
 
 @st.cache_data(show_spinner=False)
@@ -472,7 +544,7 @@ if st.session_state.get('selected_page_id'):
         </div>
         """, unsafe_allow_html=True)
 
-        # Article length indicator
+        # Article length + reading time indicator
         char_count = len(item['content'])
         if char_count < 1000:
             length_color, length_label = "#4ade80", "Short"
@@ -480,9 +552,10 @@ if st.session_state.get('selected_page_id'):
             length_color, length_label = "#f59e0b", "Medium"
         else:
             length_color, length_label = "#ef4444", "Long"
+        read_time = estimate_reading_time(item['content'], speed_pct)
         st.markdown(f"""
         <div style="font-size:0.75rem; color:{length_color}; margin-bottom:0.5rem; opacity:0.8;">
-            📝 {length_color and length_label} article · {char_count:,} characters
+            📝 {length_label} &nbsp;·&nbsp; {char_count:,} chars &nbsp;·&nbsp; 🕐 {read_time}
             {'&nbsp;·&nbsp; ⚡ Quick Preview recommended' if char_count > 3000 and not preview_mode else ''}
         </div>
         """, unsafe_allow_html=True)
