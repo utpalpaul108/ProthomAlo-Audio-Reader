@@ -1,6 +1,4 @@
 import streamlit as st
-import asyncio
-import edge_tts
 import requests
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any
@@ -8,6 +6,8 @@ import re
 import demjson3
 from datetime import datetime
 from pathlib import Path
+
+import audio_pipeline
 
 # ------------------------------------------------------------
 # STREAMLIT CONFIG
@@ -40,86 +40,6 @@ def clean_html(html: str) -> str:
     for tag in soup.find_all(["p", "div", "br", "h1", "h2", "h3", "h4", "li"]):
         tag.insert_before("\n\n")
     return soup.get_text(" ").strip()
-
-# Noise patterns that appear in scraped e-paper text and sound bad when read aloud
-_NOISE_PATTERNS = [
-    r'\(?\s*ফাইল\s*ছবি\s*\)?',          # "(ফাইল ছবি)" – file photo caption
-    r'\(?\s*ছবি\s*[:：]\s*[^)।\n]*\)?',  # "ছবি: photographer name"
-    r'\(?\s*প্রতিবেদক\s*\)?',            # reporter credit
-    r'\(?\s*সংবাদদাতা\s*\)?',            # correspondent credit
-    r'\(?\s*বিশেষ\s*প্রতিনিধি\s*\)?',   # special correspondent
-    r'\(?\s*স্টাফ\s*রিপোর্টার\s*\)?',   # staff reporter
-    r'https?://\S+',                       # raw URLs
-    r'\*{2,}',                             # repeated asterisks
-]
-
-def preprocess_for_tts(title: str, content: str) -> str:
-    """
-    Combine title + content and clean for natural, realistic TTS output.
-    - Removes noise (captions, bylines, URLs)
-    - Converts paragraph breaks into sentence-ending pauses
-    - Normalises punctuation spacing
-    """
-    # Remove noise from content before combining
-    clean = content.strip()
-    for pattern in _NOISE_PATTERNS:
-        clean = re.sub(pattern, '', clean, flags=re.IGNORECASE)
-
-    # Paragraph breaks → sentence-ending pause (। causes natural TTS pause)
-    clean = re.sub(r'\n\n+', '। ', clean)
-    clean = re.sub(r'\n', ' ', clean)
-
-    full_text = f"{title.strip()}। {clean}"
-
-    # Spacing after sentence endings
-    full_text = re.sub(r'([।!?])([^\s])', r'\1 \2', full_text)
-    # Collapse repeated punctuation
-    full_text = re.sub(r'([।!?,;])\1+', r'\1', full_text)
-    # Collapse whitespace
-    full_text = re.sub(r'\s+', ' ', full_text).strip()
-    return full_text
-
-def chunk_text(text: str, max_len: int = 2500) -> List[str]:
-    """Split text into chunks at sentence boundaries for natural TTS flow."""
-    sentences = re.split(r'(?<=[।!?])\s+', text)
-    chunks, current, current_len = [], [], 0
-    for sentence in sentences:
-        sentence_len = len(sentence) + 1
-        if current_len + sentence_len <= max_len:
-            current.append(sentence)
-            current_len += sentence_len
-        else:
-            if current:
-                chunks.append(" ".join(current))
-            if sentence_len > max_len:
-                # Sentence too long: split at commas
-                parts = re.split(r'(?<=[,;])\s+', sentence)
-                sub_current, sub_len = [], 0
-                for part in parts:
-                    part_len = len(part) + 1
-                    if sub_len + part_len <= max_len:
-                        sub_current.append(part)
-                        sub_len += part_len
-                    else:
-                        if sub_current:
-                            chunks.append(" ".join(sub_current))
-                        sub_current, sub_len = [part], part_len
-                current, current_len = sub_current, sub_len
-            else:
-                current, current_len = [sentence], sentence_len
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
-
-def truncate_for_preview(text: str, max_chars: int = 1500) -> str:
-    if len(text) <= max_chars:
-        return text
-    cut = text[:max_chars]
-    # Try to end at a sentence boundary
-    last_sentence_end = max(cut.rfind('।'), cut.rfind('?'), cut.rfind('!'))
-    if last_sentence_end > max_chars // 2:
-        return cut[:last_sentence_end + 1] + "..."
-    return cut.rsplit(' ', 1)[0] + "..."
 
 def format_date_for_api(date_obj: datetime) -> str:
     return date_obj.strftime("%d/%m/%Y")
@@ -226,32 +146,8 @@ def get_final_page_list(page_id: str):
     return [results_map[i] for i in sorted(results_map) if results_map[i]["content"].strip()]
 
 # ------------------------------------------------------------
-# TTS GENERATION
+# TTS GENERATION (delegates to audio_pipeline)
 # ------------------------------------------------------------
-async def generate_audio_chunk(text: str, voice: str, rate: str) -> bytes:
-    communicate = edge_tts.Communicate(text, voice, rate=rate)
-    output = b""
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            output += chunk["data"]
-    return output
-
-async def generate_all_chunks_async(chunks: List[str], voice: str, rate: str, progress_bar) -> bytes:
-    """Generate all chunks in parallel, then stitch in order."""
-    total = len(chunks)
-    completed = 0
-
-    async def tracked(coro):
-        nonlocal completed
-        result = await coro
-        completed += 1
-        progress_bar.progress(completed / total)
-        return result
-
-    tasks = [tracked(generate_audio_chunk(chunk, voice, rate)) for chunk in chunks]
-    results = await asyncio.gather(*tasks)
-    return b"".join(results)
-
 def estimate_reading_time(text: str, speed_pct: int) -> str:
     """Estimate TTS reading duration from character count and speed."""
     # Bangla TTS reads ~10–12 chars/sec at normal speed
@@ -265,34 +161,46 @@ def estimate_reading_time(text: str, speed_pct: int) -> str:
         return f"~{secs}s"
     return f"~{mins}m {secs}s"
 
-def generate_audio(text: str, use_preview: bool = False, voice: str = "bn-IN-BashkarNeural", rate: str = "+0%"):
-    if use_preview:
-        text = truncate_for_preview(text, max_chars=1500)
-    chunks = chunk_text(text, max_len=2500)
-    if not chunks:
-        return b""
-    progress_bar = st.progress(0)
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        audio_bytes = loop.run_until_complete(
-            generate_all_chunks_async(chunks, voice, rate, progress_bar)
-        )
-        return audio_bytes
-    finally:
-        loop.close()
-        progress_bar.empty()
+# Single-article generation lives in audio_pipeline.synthesize_article;
+# bulletin assembly lives in audio_pipeline.get_or_build_bulletin.
 
-@st.cache_data(show_spinner=False)
-def get_cached_audio(title: str, content: str, use_preview: bool = False, voice: str = "bn-IN-BashkarNeural", rate: str = "+0%"):
-    text = preprocess_for_tts(title, content)
-    return generate_audio(text, use_preview, voice, rate)
+@st.cache_data(show_spinner=False, max_entries=64)
+def get_cached_article_audio(
+    title: str,
+    content: str,
+    voice: str,
+    base_rate: str,
+    normalize_numbers: bool,
+    style_version: str = audio_pipeline.STYLE_VERSION,
+) -> bytes:
+    """In-memory cache for per-article audio. Cross-call re-renders are instant.
+
+    The style_version param is part of the key — bumping audio_pipeline
+    invalidates everything cached here without manual cache clears.
+    """
+    return audio_pipeline.synthesize_article(
+        title=title,
+        content=content,
+        voice=voice,
+        base_rate=base_rate,
+        normalize_numbers=normalize_numbers,
+    )
 
 # ------------------------------------------------------------
 # SESSION STATE
 # ------------------------------------------------------------
-if 'audio_cache' not in st.session_state:
-    st.session_state.audio_cache = {}
+# bulletin_store: keyed by (edate, page_id, voice, base_rate, normalize_numbers)
+#   → (mp3_bytes, chapters_ms)
+if 'bulletin_store' not in st.session_state:
+    st.session_state.bulletin_store = {}
+
+# article_audio: per-card audio so clicked-to-play stories survive reruns.
+# Keyed by article index within the current page.
+if 'article_audio' not in st.session_state:
+    st.session_state.article_audio = {}
+
+# ffmpeg / pydub availability — checked once at startup, surfaced as a banner.
+_FFMPEG_OK, _FFMPEG_MSG = audio_pipeline.ffmpeg_status()
 
 # ------------------------------------------------------------
 # HERO HEADER
@@ -423,13 +331,13 @@ with st.sidebar:
         help="Choose TTS voice"
     )
 
-    # Speed slider: -50% (slow) → +100% (fast), default 0%
+    # Speed slider: -50% (slow) → +100% (fast), default 0%, 5% steps
     speed_pct = st.slider(
         "🚀 Reading Speed",
         min_value=-50,
         max_value=100,
         value=0,
-        step=10,
+        step=5,
         format="%d%%",
         help="Adjust speech rate. 0% = normal, negative = slower, positive = faster."
     )
@@ -453,10 +361,11 @@ with st.sidebar:
     ">🎵 {speed_label} · {speed_option}</div>
     """, unsafe_allow_html=True)
 
-    preview_mode = st.checkbox(
-        "⚡ Quick Preview mode",
-        value=False,
-        help="Generate audio for first 1 500 characters only – much faster for long articles"
+    normalize_numbers = st.checkbox(
+        "🔢 Read numbers in Bangla words",
+        value=True,
+        help="Convert digits like ২০২৫ to spoken Bangla words (দুই হাজার পঁচিশ). "
+             "Also handles dates, percentages, currency, and phone numbers."
     )
 
     st.markdown("""
@@ -465,7 +374,7 @@ with st.sidebar:
         border-radius:10px; padding:10px 14px; margin-top:14px;
         font-size:0.78rem; color:#6a72a8; line-height:1.6;
     ">
-        💡 <strong style="color:#a5b4fc;">Tip:</strong> Enable Quick Preview for articles longer than 3 000 characters to reduce wait time.
+        📻 <strong style="color:#a5b4fc;">Bulletin mode:</strong> the whole page plays as one continuous newscast — anchor-style headlines, real silences between stories, cached on disk for instant replay.
     </div>
     """, unsafe_allow_html=True)
 
@@ -500,18 +409,96 @@ if st.session_state.get('selected_page_id'):
         st.error("❌ No news found on this page.")
         st.stop()
 
-    # Summary chip
-    st.markdown(f"""
-    <div style="
-        display:inline-flex; align-items:center; gap:8px;
-        background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.2);
-        border-radius:20px; padding:6px 16px; margin-bottom:1.5rem;
-        font-size:0.83rem; color:#4ade80; font-weight:500;
-    ">📋 {len(news_list)} articles found on this page</div>
-    """, unsafe_allow_html=True)
+    # ── Bulletin controls ──
+    bulletin_key = (today_date_str, page_id, voice_option, speed_option, normalize_numbers)
+    bulletin_entry = st.session_state.bulletin_store.get(bulletin_key)
+    bulletin_audio = bulletin_entry[0] if bulletin_entry else None
+    chapters_ms: List[int] = bulletin_entry[1] if bulletin_entry else []
 
-    # ── Article cards ──
+    est_total_ms = audio_pipeline.estimate_bulletin_duration_ms(news_list, speed_pct)
+    est_str = audio_pipeline.format_duration(est_total_ms)
+
+    summary_col, btn_col = st.columns([2, 1])
+    with summary_col:
+        st.markdown(f"""
+        <div style="
+            display:inline-flex; align-items:center; gap:10px;
+            background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.2);
+            border-radius:20px; padding:8px 18px;
+            font-size:0.85rem; color:#4ade80; font-weight:500;
+        ">📋 {len(news_list)} articles &nbsp;·&nbsp; 🕐 ~{est_str} bulletin</div>
+        """, unsafe_allow_html=True)
+
+    with btn_col:
+        if not _FFMPEG_OK:
+            st.error(f"📻 Bulletin disabled — {_FFMPEG_MSG}")
+        else:
+            btn_label = "🔁 Replay Bulletin" if bulletin_audio else f"📻 Play Full Bulletin (~{est_str})"
+            if st.button(btn_label, key="play_bulletin", use_container_width=True, type="primary"):
+                with st.status("🎙️ Generating bulletin…", expanded=True) as status:
+                    progress_bar = st.progress(0, text="Starting…")
+                    msg_box = st.empty()
+
+                    def on_progress(done, total):
+                        progress_bar.progress(done / total, text=f"Synthesising segment {done} of {total}")
+
+                    try:
+                        msg_box.markdown(f"Building {len(news_list)} articles into one continuous broadcast…")
+                        mp3, chapters = audio_pipeline.get_or_build_bulletin(
+                            news_list,
+                            edate=today_date_str,
+                            page_id=page_id,
+                            voice=voice_option,
+                            base_rate=speed_option,
+                            normalize_numbers=normalize_numbers,
+                            progress_cb=on_progress,
+                        )
+                        st.session_state.bulletin_store[bulletin_key] = (mp3, chapters)
+                        bulletin_audio, chapters_ms = mp3, chapters
+                        status.update(label="✅ Bulletin ready", state="complete", expanded=False)
+                    except Exception as e:
+                        status.update(label=f"❌ Bulletin failed: {e}", state="error")
+                        st.exception(e)
+
+    # ── Bulletin player (sticky-ish at top once generated) ──
+    if bulletin_audio:
+        st.markdown('<div style="margin:1rem 0 1.5rem;"></div>', unsafe_allow_html=True)
+        st.audio(bulletin_audio, format="audio/mp3")
+        st.markdown(f"""
+        <div style="font-size:0.75rem; color:#6a72a8; margin-top:0.4rem; text-align:right;">
+            📦 {len(bulletin_audio)//1024:,} KB &nbsp;·&nbsp; cached on disk for instant replay
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style="
+            background:rgba(61,58,248,0.06); border:1px dashed rgba(100,108,255,0.25);
+            border-radius:14px; padding:1.2rem 1.5rem; margin:1rem 0 1.5rem;
+            font-size:0.85rem; color:#8b85ff; text-align:center;
+        ">
+            🎙️ Click <strong>Play Full Bulletin</strong> above to generate today's broadcast.
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Article cards (chapter markers) ──
+    st.markdown('<div style="font-size:0.78rem;color:#6a72a8;font-weight:600;letter-spacing:0.06em;margin:1.5rem 0 0.75rem;">STORY LIST</div>', unsafe_allow_html=True)
+
     for idx, item in enumerate(news_list):
+
+        # Chapter timestamp (only if bulletin is loaded)
+        if chapters_ms and idx < len(chapters_ms):
+            ts = audio_pipeline.format_duration(chapters_ms[idx])
+            ts_html = f"""
+              <div style="
+                position:absolute; right:1rem; top:1.1rem;
+                background:rgba(61,58,248,0.18); border:1px solid rgba(61,58,248,0.35);
+                border-radius:6px; padding:3px 10px;
+                font-size:0.72rem; font-weight:600; color:#a5b4fc;
+                font-variant-numeric: tabular-nums;
+              ">⏱ {ts}</div>
+            """
+        else:
+            ts_html = ""
 
         # Card wrapper
         st.markdown(f"""
@@ -519,23 +506,25 @@ if st.session_state.get('selected_page_id'):
             background: linear-gradient(145deg, #0f1228 0%, #111530 100%);
             border: 1px solid rgba(100,108,255,0.15);
             border-radius: 16px;
-            padding: 1.5rem 1.75rem 1.25rem;
-            margin-bottom: 1.25rem;
-            transition: border-color 0.3s;
+            padding: 1.1rem 1.5rem 1rem;
+            margin-bottom: 0.9rem;
             position: relative;
             overflow: hidden;
         ">
           <!-- Subtle left accent bar -->
           <div style="
-            position:absolute; left:0; top:16px; bottom:16px;
+            position:absolute; left:0; top:14px; bottom:14px;
             width:3px; border-radius:0 3px 3px 0;
             background: linear-gradient(180deg,#3d3af8,#6c63ff);
           "></div>
+          {ts_html}
 
-          <!-- Title -->
-          <div style="padding-left:10px;">
+          <div style="padding-left:10px; padding-right:{'4.5rem' if ts_html else '0'};">
+            <div style="font-size:0.7rem; color:#6a72a8; font-weight:600; margin-bottom:3px;">
+              #{idx+1}
+            </div>
             <h3 style="
-              font-size:1.05rem; font-weight:700;
+              font-size:1rem; font-weight:700;
               color:#e8eaff; line-height:1.45;
               font-family:'Inter','Noto Sans Bengali',sans-serif;
               margin:0;
@@ -544,43 +533,44 @@ if st.session_state.get('selected_page_id'):
         </div>
         """, unsafe_allow_html=True)
 
-        # Article length + reading time indicator
+        # Per-card listen controls — generate just this story.
         char_count = len(item['content'])
-        if char_count < 1000:
-            length_color, length_label = "#4ade80", "Short"
-        elif char_count < 3000:
-            length_color, length_label = "#f59e0b", "Medium"
-        else:
-            length_color, length_label = "#ef4444", "Long"
         read_time = estimate_reading_time(item['content'], speed_pct)
-        st.markdown(f"""
-        <div style="font-size:0.75rem; color:{length_color}; margin-bottom:0.5rem; opacity:0.8;">
-            📝 {length_label} &nbsp;·&nbsp; {char_count:,} chars &nbsp;·&nbsp; 🕐 {read_time}
-            {'&nbsp;·&nbsp; ⚡ Quick Preview recommended' if char_count > 3000 and not preview_mode else ''}
-        </div>
-        """, unsafe_allow_html=True)
+        article_key = (page_id, idx, voice_option, speed_option, normalize_numbers)
+        article_audio_bytes = st.session_state.article_audio.get(article_key)
 
-        # Generate Audio button (full width)
-        btn_label = "⚡ Quick Preview" if preview_mode else "▶ Generate Audio"
-        play_key = f"play_{idx}"
-        if st.button(btn_label, key=play_key, use_container_width=True):
-            with st.spinner("🎧 Synthesising speech…"):
-                audio_data = get_cached_audio(item['title'], item['content'], preview_mode, voice_option, speed_option)
-            if audio_data:
-                st.session_state.audio_cache[idx] = audio_data
-            else:
-                st.error("⚠️ Audio generation failed, please try again.")
+        listen_col, info_col = st.columns([1, 2])
+        with listen_col:
+            listen_label = "🔁 Replay this story" if article_audio_bytes else f"▶ Listen ({read_time})"
+            if st.button(listen_label, key=f"listen_{idx}", use_container_width=True):
+                with st.spinner(f"🎧 Synthesising story #{idx+1}…"):
+                    progress_bar = st.progress(0)
+                    try:
+                        def on_prog(done, total):
+                            progress_bar.progress(done / total)
+                        article_audio_bytes = get_cached_article_audio(
+                            title=item['title'],
+                            content=item['content'],
+                            voice=voice_option,
+                            base_rate=speed_option,
+                            normalize_numbers=normalize_numbers,
+                        )
+                        st.session_state.article_audio[article_key] = article_audio_bytes
+                    finally:
+                        progress_bar.empty()
+        with info_col:
+            st.markdown(f"""
+            <div style="font-size:0.75rem; color:#6a72a8; padding-top:0.55rem;">
+                {char_count:,} chars · {read_time} reading time
+            </div>
+            """, unsafe_allow_html=True)
 
-        # Audio player
-        if idx in st.session_state.audio_cache:
-            st.markdown('<div style="margin-top:0.4rem;"></div>', unsafe_allow_html=True)
-            st.audio(st.session_state.audio_cache[idx], format="audio/mp3")
+        if article_audio_bytes:
+            st.audio(article_audio_bytes, format="audio/mp3")
 
         # Article text expander
-        with st.expander("📄 Read full article"):
+        with st.expander(f"📄 Read full text"):
             st.markdown(f'<p style="color:#a8b0d8;line-height:1.8;font-size:0.9rem;">{item["content"]}</p>', unsafe_allow_html=True)
-
-        st.markdown("<div style='height:0.25rem;'></div>", unsafe_allow_html=True)
 
 else:
     # Empty state
@@ -618,11 +608,11 @@ st.markdown("""
 ">
     <div>
         <span style="font-size:0.85rem; font-weight:700; color:#6c63ff;">🎙️ প্রথম আলো · Audio Reader</span>
-        <span style="font-size:0.75rem; color:#374060; margin-left:10px;">v2.0</span>
+        <span style="font-size:0.75rem; color:#374060; margin-left:10px;">v3.0 · Bulletin</span>
     </div>
     <div style="font-size:0.78rem; color:#4a5280; line-height:1.6; text-align:right;">
-        ⚡ Use <strong style="color:#6c63ff;">Quick Preview</strong> for articles &gt; 3 000 chars &nbsp;·&nbsp;
-        🔁 Audio is cached for repeated plays
+        📻 <strong style="color:#6c63ff;">Radio bulletin mode</strong> &nbsp;·&nbsp;
+        💾 Bulletins disk-cached at <code style="color:#8b85ff;">~/.cache/prothomalo-audio-reader/</code>
     </div>
 </div>
 """, unsafe_allow_html=True)

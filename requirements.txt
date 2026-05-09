@@ -4,3 +4,5 @@ beautifulsoup4 == 4.14.3
 edge-tts == 7.2.7
 aiohttp == 3.13.3
 demjson3 == 3.0.6
+pydub == 0.25.1
+num2words >= 0.5.13
